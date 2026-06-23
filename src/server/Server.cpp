@@ -201,6 +201,13 @@ void Server::handleClient(platform::socket_t clientFd, std::string clientAddress
     std::cout << "[Client] Connected: " << clientAddress << "\n";
     info_.clientConnected();
 
+    // Initialize the per-client write mutex.
+    {
+        std::lock_guard<std::mutex> lock(writeMutexMapMutex_);
+        clientWriteMutexes_[clientFd] = std::make_shared<std::mutex>();
+    }
+
+    static constexpr size_t kMaxAccumulatedBytes = 65536; // 64KB
     constexpr size_t kBufSize = 4096;
     char buf[kBufSize];
     std::string accumulated;  // Holds partial reads across recv() calls.
@@ -222,6 +229,13 @@ void Server::handleClient(platform::socket_t clientFd, std::string clientAddress
         }
 
         accumulated.append(buf, static_cast<size_t>(bytesRead));
+
+        if (accumulated.size() > kMaxAccumulatedBytes) {
+            writeToClient(clientFd, "ERR max input buffer exceeded, disconnecting\n");
+            std::cerr << "[WARN] Client " << clientFd 
+                      << " exceeded max buffer size, disconnecting\n";
+            break;
+        }
 
         // Process every complete newline-delimited command.
         size_t pos;
@@ -715,22 +729,18 @@ std::string Server::executeCommandUnlocked(const Command& cmd, platform::socket_
 // writeToClient() — thread-safe per-client socket write
 // ---------------------------------------------------------------------------
 void Server::writeToClient(platform::socket_t clientFd, const std::string& response) {
-    // Obtain (or lazily create) the per-client write mutex.
-    std::unique_ptr<std::mutex>* mtxPtr = nullptr;
+    std::shared_ptr<std::mutex> writeMutex;
     {
         std::lock_guard<std::mutex> lock(writeMutexMapMutex_);
         auto it = clientWriteMutexes_.find(clientFd);
         if (it == clientWriteMutexes_.end()) {
-            auto [inserted, _] = clientWriteMutexes_.emplace(
-                clientFd, std::make_unique<std::mutex>());
-            mtxPtr = &inserted->second;
-        } else {
-            mtxPtr = &it->second;
+            return; // already gone
         }
+        writeMutex = it->second;
     }
 
     // Serialize writes to this particular client socket.
-    std::lock_guard<std::mutex> clientLock(**mtxPtr);
+    std::lock_guard<std::mutex> clientLock(*writeMutex);
 
     const char* data = response.c_str();
     size_t remaining = response.size();

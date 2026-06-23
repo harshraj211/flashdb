@@ -70,7 +70,7 @@ private:
     // Client management
     std::vector<std::thread> clientThreads_;
     std::mutex clientsMutex_;
-    std::unordered_map<platform::socket_t, std::unique_ptr<std::mutex>> clientWriteMutexes_;
+    std::unordered_map<platform::socket_t, std::shared_ptr<std::mutex>> clientWriteMutexes_;
     std::mutex writeMutexMapMutex_;
 
     // Signal handling
