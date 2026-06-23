@@ -141,8 +141,7 @@ void Server::stop() {
         serverFd_ = platform::INVALID_SOCK;
     }
 
-    // Halt the background expiry thread.
-    expiry_.stopExpiryLoop();
+    // ExpiryManager background thread stops automatically when server is destroyed.
 
     // Persist any buffered AOF writes and close the file.
     if (aof_) {
@@ -286,9 +285,13 @@ std::string Server::processCommand(const Command& cmd, platform::socket_t client
             }
 
             std::ostringstream oss;
-            for (size_t i = 0; i < queued.size(); ++i) {
-                std::string result = executeCommand(queued[i], clientFd);
-                oss << (i + 1) << ") " << result;
+            // Acquire exclusive lock on StorageEngine ONCE for the duration of the transaction.
+            {
+                std::unique_lock<std::shared_mutex> txLock(storage_.getMutex());
+                for (size_t i = 0; i < queued.size(); ++i) {
+                    std::string result = executeCommandUnlocked(queued[i], clientFd);
+                    oss << (i + 1) << ") " << result;
+                }
             }
 
             // Propagate write commands that were part of the transaction
@@ -435,6 +438,198 @@ std::string Server::executeCommand(const Command& cmd, platform::socket_t client
     if (cmd.name == "EXPIRE") {
         const std::string& key = cmd.args[0];
         if (!storage_.exists(key)) {
+            return "(integer) 0\n";
+        }
+        try {
+            int seconds = std::stoi(cmd.args[1]);
+            expiry_.setExpirySeconds(key, seconds);
+        } catch (const std::exception&) {
+            return "ERR value is not an integer or out of range\n";
+        }
+
+        if (aof_) {
+            aof_->appendCommand(rawCommand());
+        }
+        replication_.propagate(rawCommand());
+
+        return "(integer) 1\n";
+    }
+
+    // ---- SUBSCRIBE channel ----
+    if (cmd.name == "SUBSCRIBE") {
+        const std::string& channel = cmd.args[0];
+        int count = pubsub_.subscribe(channel, clientKey);
+        return "Subscribed to " + channel + " (" + std::to_string(count) +
+               " total)\n";
+    }
+
+    // ---- UNSUBSCRIBE channel ----
+    if (cmd.name == "UNSUBSCRIBE") {
+        const std::string& channel = cmd.args[0];
+        int count = pubsub_.unsubscribe(channel, clientKey);
+        return "Unsubscribed from " + channel + " (" + std::to_string(count) +
+               " remaining)\n";
+    }
+
+    // ---- PUBLISH channel message ----
+    if (cmd.name == "PUBLISH") {
+        const std::string& channel = cmd.args[0];
+        const std::string& message = cmd.args[1];
+
+        auto writeFn = [this](int fd, const std::string& msg) {
+            writeToClient(static_cast<platform::socket_t>(fd), msg);
+        };
+
+        int receivers = pubsub_.publish(channel, message, writeFn);
+        return "(integer) " + std::to_string(receivers) + "\n";
+    }
+
+    // ---- MULTI ----
+    if (cmd.name == "MULTI") {
+        return txManager_.beginTransaction(clientKey) + "\n";
+    }
+
+    // ---- EXEC (outside of transaction context) ----
+    if (cmd.name == "EXEC") {
+        return "ERR EXEC without MULTI\n";
+    }
+
+    // ---- DISCARD (outside of transaction context) ----
+    if (cmd.name == "DISCARD") {
+        return txManager_.discardTransaction(clientKey) + "\n";
+    }
+
+    // ---- REPLICAOF host port ----
+    if (cmd.name == "REPLICAOF") {
+        try {
+            uint16_t port = static_cast<uint16_t>(std::stoi(cmd.args[1]));
+            replication_.connectToMaster(cmd.args[0], port, storage_, expiry_);
+        } catch (const std::exception&) {
+            return "ERR invalid port number\n";
+        }
+        return "OK\n";
+    }
+
+    // ---- INFO ----
+    if (cmd.name == "INFO") {
+        return info_.getInfo();
+    }
+
+    // ---- Unknown command ----
+    return "ERR unknown command '" + cmd.name + "'\n";
+}
+
+// ---------------------------------------------------------------------------
+// executeCommandUnlocked() — same as executeCommand but uses unlocked storage calls
+// ---------------------------------------------------------------------------
+std::string Server::executeCommandUnlocked(const Command& cmd, platform::socket_t clientFd) {
+    int clientKey = static_cast<int>(clientFd);
+    
+    // Helper: reconstruct the raw command string for AOF / replication.
+    auto rawCommand = [&]() -> std::string {
+        std::string raw = cmd.name;
+        for (const auto& arg : cmd.args) {
+            raw += " " + arg;
+        }
+        return raw;
+    };
+
+    // ---- PING ----
+    if (cmd.name == "PING") {
+        if (!cmd.args.empty()) {
+            return cmd.args[0] + "\n";
+        }
+        return "PONG\n";
+    }
+
+    // ---- SET key value [EX seconds] ----
+    if (cmd.name == "SET") {
+        const std::string& key = cmd.args[0];
+        const std::string& value = cmd.args[1];
+
+        storage_.setUnlocked(key, value);
+
+        // Optional EX flag for inline TTL.
+        if (cmd.args.size() >= 4 && cmd.args[2] == "EX") {
+            try {
+                int seconds = std::stoi(cmd.args[3]);
+                expiry_.setExpirySeconds(key, seconds);
+            } catch (const std::exception&) {
+                return "ERR value is not an integer or out of range\n";
+            }
+        }
+
+        if (aof_) {
+            aof_->appendCommand(rawCommand());
+        }
+        replication_.propagate(rawCommand());
+
+        return "OK\n";
+    }
+
+    // ---- GET key ----
+    if (cmd.name == "GET") {
+        auto val = storage_.getUnlocked(cmd.args[0]);
+        return val ? *val + "\n" : "(nil)\n";
+    }
+
+    // ---- DEL key [key ...] ----
+    if (cmd.name == "DEL") {
+        int count = storage_.delUnlocked(cmd.args);
+
+        if (aof_) {
+            aof_->appendCommand(rawCommand());
+        }
+        replication_.propagate(rawCommand());
+
+        return "(integer) " + std::to_string(count) + "\n";
+    }
+
+    // ---- EXISTS key ----
+    if (cmd.name == "EXISTS") {
+        return std::string("(integer) ") +
+               (storage_.existsUnlocked(cmd.args[0]) ? "1" : "0") + "\n";
+    }
+
+    // ---- KEYS ----
+    if (cmd.name == "KEYS") {
+        auto allKeys = storage_.keysUnlocked();
+        if (allKeys.empty()) {
+            return "(empty list)\n";
+        }
+        std::ostringstream oss;
+        for (size_t i = 0; i < allKeys.size(); ++i) {
+            oss << (i + 1) << ") " << allKeys[i] << "\n";
+        }
+        return oss.str();
+    }
+
+    // ---- FLUSHALL ----
+    if (cmd.name == "FLUSHALL") {
+        storage_.flushAllUnlocked();
+
+        if (aof_) {
+            aof_->appendCommand(rawCommand());
+        }
+        replication_.propagate(rawCommand());
+
+        return "OK\n";
+    }
+
+    // ---- TTL key ----
+    if (cmd.name == "TTL") {
+        const std::string& key = cmd.args[0];
+        if (!storage_.existsUnlocked(key)) {
+            return "(integer) -2\n";
+        }
+        int ttl = expiry_.getTTL(key);
+        return "(integer) " + std::to_string(ttl) + "\n";
+    }
+
+    // ---- EXPIRE key seconds ----
+    if (cmd.name == "EXPIRE") {
+        const std::string& key = cmd.args[0];
+        if (!storage_.existsUnlocked(key)) {
             return "(integer) 0\n";
         }
         try {

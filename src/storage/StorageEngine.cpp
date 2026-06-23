@@ -132,16 +132,89 @@ size_t StorageEngine::size() const {
 
 std::vector<std::pair<std::string, std::string>> StorageEngine::getAllEntries() const {
     std::shared_lock lock(rwMutex_);
+    return getAllEntriesUnlocked();
+}
+
+bool StorageEngine::setUnlocked(const std::string& key, const std::string& value) {
+    store_[key] = value;
+    return true;
+}
+
+std::optional<std::string> StorageEngine::getUnlocked(const std::string& key) {
+    auto it = store_.find(key);
+    if (it == store_.end()) {
+        return std::nullopt;
+    }
+
+    if (isKeyExpired(key)) {
+        store_.erase(it);
+        if (expiryMgr_) {
+            expiryMgr_->removeExpiry(key);
+        }
+        return std::nullopt;
+    }
+
+    return it->second;
+}
+
+int StorageEngine::delUnlocked(const std::vector<std::string>& keys) {
+    int deletedCount = 0;
+    for (const auto& key : keys) {
+        auto it = store_.find(key);
+        if (it != store_.end()) {
+            store_.erase(it);
+            if (expiryMgr_) {
+                expiryMgr_->removeExpiry(key);
+            }
+            ++deletedCount;
+        }
+    }
+    return deletedCount;
+}
+
+bool StorageEngine::existsUnlocked(const std::string& key) {
+    auto it = store_.find(key);
+    if (it == store_.end()) {
+        return false;
+    }
+
+    if (isKeyExpired(key)) {
+        store_.erase(it);
+        if (expiryMgr_) {
+            expiryMgr_->removeExpiry(key);
+        }
+        return false;
+    }
+
+    return true;
+}
+
+std::vector<std::string> StorageEngine::keysUnlocked() {
+    std::vector<std::string> result;
+    result.reserve(store_.size());
+    for (const auto& [key, value] : store_) {
+        if (!isKeyExpired(key)) {
+            result.push_back(key);
+        }
+    }
+    return result;
+}
+
+void StorageEngine::flushAllUnlocked() {
+    store_.clear();
+    if (expiryMgr_) {
+        expiryMgr_->clear();
+    }
+}
+
+std::vector<std::pair<std::string, std::string>> StorageEngine::getAllEntriesUnlocked() const {
     std::vector<std::pair<std::string, std::string>> entries;
     entries.reserve(store_.size());
-
     for (const auto& [key, value] : store_) {
-        // Only include non-expired entries for replication.
         if (!isKeyExpired(key)) {
             entries.emplace_back(key, value);
         }
     }
-
     return entries;
 }
 

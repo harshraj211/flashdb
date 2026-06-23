@@ -45,6 +45,9 @@ private:
     // Execute a command (shared between direct execution and transaction EXEC)
     std::string executeCommand(const Command& cmd, platform::socket_t clientFd);
 
+    // Execute a command without acquiring StorageEngine lock (called during atomic EXEC)
+    std::string executeCommandUnlocked(const Command& cmd, platform::socket_t clientFd);
+
     // Write response to client fd (thread-safe per-client)
     void writeToClient(platform::socket_t clientFd, const std::string& response);
 
