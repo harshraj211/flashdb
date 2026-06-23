@@ -39,10 +39,8 @@ public:
     // Process incoming replication stream (runs in background thread)
     void processReplicationStream(platform::socket_t masterFd,
                                   StorageEngine& storage,
-                                  ExpiryManager& expiry);
-    
-    // Stop replication
-    void stopReplication();
+                                  ExpiryManager& expiry,
+                                  std::stop_token stopToken);
     
     // === Status ===
     bool isMaster() const { return isMaster_; }
@@ -53,14 +51,13 @@ private:
     mutable std::mutex replicaMutex_;
     std::atomic<bool> isMaster_{true};
     platform::socket_t masterFd_ = platform::INVALID_SOCK; // On replica: connection to master
-    std::atomic<bool> replicating_{false};
-    std::thread replicationThread_;
+    std::jthread replicationThread_;
     
     // Send full dataset to a newly connected replica
     // IMPORTANT: Must acquire storage read lock during full sync to ensure
     // atomic snapshot. If keys are written during sync, replica could get
     // partial state.
-    void sendFullSync(platform::socket_t replicaFd, StorageEngine& storage);
+    bool sendFullSync(platform::socket_t replicaFd, StorageEngine& storage);
     
     // Write a string to a socket fd
     bool writeToFd(platform::socket_t fd, const std::string& data);

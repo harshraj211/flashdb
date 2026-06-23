@@ -14,9 +14,7 @@ namespace flashdb {
 ReplicationManager::ReplicationManager() = default;
 
 ReplicationManager::~ReplicationManager() {
-    stopReplication();
-
-    // Close master connection if we were a replica
+    // Close master connection if we were a replica to unblock read() in the replication thread
     if (platform::isValidSocket(masterFd_)) {
         platform::closeSocket(masterFd_);
         masterFd_ = platform::INVALID_SOCK;
@@ -33,34 +31,46 @@ ReplicationManager::~ReplicationManager() {
 }
 
 void ReplicationManager::addReplica(platform::socket_t replicaFd, StorageEngine& storage) {
+    bool syncSuccess = false;
     {
+        // Take a shared lock on the StorageEngine during the full sync to prevent concurrent writes from corrupting the stream.
+        std::shared_lock<std::shared_mutex> lock(storage.getMutex());
+        syncSuccess = sendFullSync(replicaFd, storage);
+    }
+
+    if (syncSuccess) {
         std::lock_guard<std::mutex> lock(replicaMutex_);
         replicaFds_.push_back(replicaFd);
+    } else {
+        std::cerr << "[REPL] Full sync failed. Closing replica socket.\n";
+        platform::closeSocket(replicaFd);
     }
-    sendFullSync(replicaFd, storage);
 }
 
-void ReplicationManager::sendFullSync(platform::socket_t replicaFd, StorageEngine& storage) {
+bool ReplicationManager::sendFullSync(platform::socket_t replicaFd, StorageEngine& storage) {
     // Send sync start marker
-    writeToFd(replicaFd, "FULLSYNC\n");
+    if (!writeToFd(replicaFd, "FULLSYNC\n")) {
+        return false;
+    }
 
-    // getAllEntries() acquires storage's shared_lock, ensuring we get a
-    // consistent snapshot. Writes that arrive during sync will be propagated
-    // separately after FULLSYNC_DONE.
-    auto entries = storage.getAllEntries();
+    // Use getAllEntriesUnlocked() since we already hold the shared lock on storage.
+    auto entries = storage.getAllEntriesUnlocked();
     for (const auto& [key, value] : entries) {
         std::string cmd = "SET " + key + " " + value + "\n";
         if (!writeToFd(replicaFd, cmd)) {
             std::cerr << "[REPL] Failed to send SET during full sync to fd "
                       << replicaFd << "\n";
-            return;
+            return false;
         }
     }
 
     // Send sync completion marker
-    writeToFd(replicaFd, "FULLSYNC_DONE\n");
+    if (!writeToFd(replicaFd, "FULLSYNC_DONE\n")) {
+        return false;
+    }
     std::cout << "[REPL] Full sync sent to replica fd " << replicaFd
               << " (" << entries.size() << " keys)\n";
+    return true;
 }
 
 void ReplicationManager::propagate(const std::string& command) {
@@ -132,24 +142,24 @@ void ReplicationManager::connectToMaster(const std::string& host, uint16_t port,
     // Transition to replica mode
     isMaster_ = false;
     masterFd_ = sockFd;
-    replicating_ = true;
 
     // Send handshake
     writeToFd(sockFd, "REPLICAOF\n");
 
     // Launch background thread for replication stream processing
-    replicationThread_ = std::thread([this, &storage, &expiry]() {
-        processReplicationStream(masterFd_, storage, expiry);
+    replicationThread_ = std::jthread([this, &storage, &expiry](std::stop_token stopToken) {
+        processReplicationStream(masterFd_, storage, expiry, stopToken);
     });
 }
 
 void ReplicationManager::processReplicationStream(platform::socket_t masterFd,
                                                    StorageEngine& storage,
-                                                   ExpiryManager& expiry) {
+                                                   ExpiryManager& expiry,
+                                                   std::stop_token stopToken) {
     std::string buffer;
     char readBuf[4096];
 
-    while (replicating_.load()) {
+    while (!stopToken.stop_requested()) {
         ssize_t bytesRead = platform::socketRead(masterFd, readBuf, sizeof(readBuf));
         if (bytesRead <= 0) {
             if (bytesRead == 0) {
@@ -232,21 +242,6 @@ void ReplicationManager::processReplicationStream(platform::socket_t masterFd,
     }
 
     std::cout << "[REPL] Replication stream processing stopped.\n";
-}
-
-void ReplicationManager::stopReplication() {
-    replicating_ = false;
-
-    // Close master connection to unblock read() in the replication thread
-    if (platform::isValidSocket(masterFd_)) {
-        platform::closeSocket(masterFd_);
-        masterFd_ = platform::INVALID_SOCK;
-    }
-
-    // Join the replication thread if it's running
-    if (replicationThread_.joinable()) {
-        replicationThread_.join();
-    }
 }
 
 size_t ReplicationManager::replicaCount() const {
