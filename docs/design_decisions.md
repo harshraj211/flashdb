@@ -278,3 +278,26 @@ We modernized the thread lifecycle management to C++20 `std::jthread` and `std::
 1. **Automatic Join**: `std::jthread` automatically requests cancellation (via its stop token) and joins upon destruction, guaranteeing leak-free cleanup without manual `join()` boilerplate.
 2. **Cooperative Cancellation**: Threads accept a `std::stop_token` and loop checking `!stopToken.stop_requested()`.
 3. **Simplified Destructors**: Destructors are simplified to default implementations, letting the compiler handle thread shutdown automatically. To prevent threads from blocking on socket reads during shutdown, the socket is closed in the class destructor first, immediately unblocking the thread's read loop and letting it exit cleanly.
+
+---
+
+## 12. Known Limitation: Text Protocol Parser
+
+FlashDB currently uses a whitespace-delimited text protocol.
+Keys and values cannot contain spaces or newline characters.
+
+Root cause: CommandParser::tokenize uses std::istringstream
+which splits on whitespace boundaries.
+
+Impact: SET key "hello world" is parsed as SET with args
+["key", "\"hello", "world\""] — incorrect.
+
+Production fix: Implement Redis RESP (REdis Serialization
+Protocol) — a length-prefixed binary-safe protocol:
+*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$5\r\nHarsh\r\n
+
+RESP encodes argument count and byte lengths explicitly,
+making it immune to whitespace in values. This would also
+make FlashDB compatible with redis-cli and any Redis client
+library. Tracked as a future enhancement.
+

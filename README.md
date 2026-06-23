@@ -244,6 +244,10 @@ flashdb/
     └── appendonly.aof
 ```
 
+## Known Limitations
+
+- Values and keys cannot contain spaces (text protocol limitation). Full Redis RESP protocol support is planned.
+
 ## Contributing
 
 1. Fork the repository
