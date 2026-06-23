@@ -1,0 +1,2 @@
+add_executable(flashdb_benchmark benchmark.cpp)
+target_link_libraries(flashdb_benchmark PRIVATE flashdb_lib)
