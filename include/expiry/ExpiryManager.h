@@ -25,14 +25,12 @@ public:
     void clear();
 
     void startExpiryLoop(StorageEngine& storage);
-    void stopExpiryLoop();
 
 private:
     std::unordered_map<std::string,
         std::chrono::steady_clock::time_point> expiryMap_;
     mutable std::mutex mutex_;
-    std::atomic<bool> running_{false};
-    std::thread expiryThread_;
+    std::jthread expiryThread_;
 };
 
 } // namespace flashdb

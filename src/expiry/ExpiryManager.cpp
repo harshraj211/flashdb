@@ -6,9 +6,7 @@ namespace flashdb {
 
 ExpiryManager::ExpiryManager() = default;
 
-ExpiryManager::~ExpiryManager() {
-    stopExpiryLoop();
-}
+ExpiryManager::~ExpiryManager() = default;
 
 void ExpiryManager::setExpiry(const std::string& key,
                               std::chrono::steady_clock::time_point expiresAt) {
@@ -69,21 +67,15 @@ void ExpiryManager::clear() {
 }
 
 void ExpiryManager::startExpiryLoop(StorageEngine& storage) {
-    // Prevent double-start.
-    if (running_.load()) {
-        return;
+    if (expiryThread_.joinable()) {
+        return; // Already running
     }
 
-    running_.store(true);
-
-    expiryThread_ = std::thread([this, &storage]() {
-        while (running_.load()) {
+    expiryThread_ = std::jthread([this, &storage](std::stop_token stopToken) {
+        while (!stopToken.stop_requested()) {
             std::vector<std::string> expiredKeys;
 
             // Phase 1: Collect expired keys under the ExpiryManager mutex.
-            // We must NOT hold this mutex while calling storage.del(),
-            // because storage.del() calls expiryMgr_->removeExpiry(),
-            // which would attempt to re-acquire this mutex → deadlock.
             {
                 std::lock_guard lock(mutex_);
                 auto now = std::chrono::steady_clock::now();
@@ -96,9 +88,6 @@ void ExpiryManager::startExpiryLoop(StorageEngine& storage) {
             }
 
             // Phase 2: Delete expired keys WITHOUT holding ExpiryManager mutex.
-            // storage.del() will acquire its own unique_lock on rwMutex_ and
-            // then call removeExpiry() for each deleted key, which safely
-            // acquires the ExpiryManager mutex without deadlocking.
             if (!expiredKeys.empty()) {
                 storage.del(expiredKeys);
             }
@@ -107,18 +96,6 @@ void ExpiryManager::startExpiryLoop(StorageEngine& storage) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     });
-}
-
-void ExpiryManager::stopExpiryLoop() {
-    if (!running_.load()) {
-        return;
-    }
-
-    running_.store(false);
-
-    if (expiryThread_.joinable()) {
-        expiryThread_.join();
-    }
 }
 
 } // namespace flashdb
