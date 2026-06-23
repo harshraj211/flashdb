@@ -28,6 +28,9 @@ const std::unordered_map<std::string, int> CommandParser::minArgs_ = {
     {"PING",      0},  // PING [message]
 };
 
+// NOTE: Whitespace-delimited tokenization. Keys and values
+// cannot contain spaces. For binary-safe parsing, implement
+// RESP protocol. See docs/design_decisions.md for details.
 std::vector<std::string> CommandParser::tokenize(const std::string& input) {
     std::vector<std::string> tokens;
     std::istringstream stream(input);
