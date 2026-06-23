@@ -237,3 +237,44 @@ The main complexity this introduces is the circular dependency: StorageEngine
 calls ExpiryManager to check expiry, and ExpiryManager's background thread calls
 StorageEngine to delete expired keys. This is resolved with a carefully designed
 locking hierarchy documented in `docs/architecture.md`.
+
+---
+
+## 9. Transaction Atomicity Implementation
+
+### The Problem
+Previously, when the transaction `EXEC` loop executed a batch of queued commands, it called `executeCommand` on each command individually. Since each `executeCommand` acquired and released the `StorageEngine`'s mutex independently, other client threads could interleave write operations in between commands, breaking transaction atomicity.
+
+### The Solution
+We hardened the `EXEC` implementation by:
+1. Exposing the underlying `std::shared_mutex` of the `StorageEngine` through `getMutex()`.
+2. Acquiring a **single** exclusive `std::unique_lock` on the `StorageEngine`'s mutex for the entire duration of the transaction loop in `Server.cpp`.
+3. Creating internal unlocked versions of storage operations (`setUnlocked`, `getUnlocked`, `delUnlocked`, `existsUnlocked`, `keysUnlocked`, `flushAllUnlocked`) that run directly on the data map without acquiring a lock.
+4. Routing commands inside the locked `EXEC` loop through a new `executeCommandUnlocked` handler, preventing self-deadlock (since `std::shared_mutex` is non-recursive) while ensuring complete isolation from other thread modifications.
+
+---
+
+## 10. Replication Full Sync Ordering
+
+### The Problem
+During new replica connections, if the replica socket descriptor was registered in `replicaFds_` *before* the master finished transmitting the full snapshot (`sendFullSync`), concurrent client writes could trigger `propagate()`. Because `propagate()` runs concurrently on multiple client threads and writes directly to the replica socket, the bytes of live writes would interleave with the bytes of the snapshot, causing replication stream corruption.
+
+### The Solution
+We corrected this behavior by implementing a strict sequence:
+1. **Sync First**: `sendFullSync` is called *first* to write the initial snapshot (`FULLSYNC ... FULLSYNC_DONE`) to the replica.
+2. **Lock Isolation**: The sync process is wrapped in a `std::shared_lock` on the `StorageEngine`'s mutex, ensuring that no client write can execute or attempt propagation *during* the snapshot creation.
+3. **Unlocked Retrieval**: Inside `sendFullSync`, we retrieve data using `getAllEntriesUnlocked()` since the thread already holds the shared lock.
+4. **Delayed Registration**: The replica socket descriptor is added to `replicaFds_` *only after* the full snapshot completes successfully. If the sync fails (e.g. network timeout/closed socket), the replica is discarded immediately and not registered, preventing memory leaks and broken socket writes.
+
+---
+
+## 11. Modern C++20 Thread Management (`std::jthread`)
+
+### The Problem
+Initially, background threads (`ExpiryManager` cleanup loop and `ReplicationManager` replica stream reader) used C++11-style `std::thread`. This required maintaining a manual `std::atomic<bool> running_` flag, manual shutdown methods (`stopExpiryLoop`, `stopReplication`), and writing boilerplate `join()` code in destructors. If a destructor threw an exception or forgot to join, the program would abort due to active `std::thread` destruction.
+
+### The Solution
+We modernized the thread lifecycle management to C++20 `std::jthread` and `std::stop_token`:
+1. **Automatic Join**: `std::jthread` automatically requests cancellation (via its stop token) and joins upon destruction, guaranteeing leak-free cleanup without manual `join()` boilerplate.
+2. **Cooperative Cancellation**: Threads accept a `std::stop_token` and loop checking `!stopToken.stop_requested()`.
+3. **Simplified Destructors**: Destructors are simplified to default implementations, letting the compiler handle thread shutdown automatically. To prevent threads from blocking on socket reads during shutdown, the socket is closed in the class destructor first, immediately unblocking the thread's read loop and letting it exit cleanly.
