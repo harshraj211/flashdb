@@ -1,0 +1,26 @@
+# Build
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cache/
+compile_commands.json
+
+# Runtime data
+data/*.aof
+
+# Generated reports
+benchmarks/benchmark_report.md
+
+# OS
+.DS_Store
+Thumbs.db
