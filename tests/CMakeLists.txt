@@ -14,6 +14,7 @@ add_executable(flashdb_tests
     test_expiry.cpp
     test_pubsub.cpp
     test_transactions.cpp
+    test_aof.cpp
 )
 
 target_link_libraries(flashdb_tests PRIVATE
