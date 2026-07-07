@@ -69,6 +69,14 @@ TEST(ParserTest, Ping) {
     EXPECT_EQ(cmd.args.size(), 0u);
 }
 
+TEST(ParserTest, Auth) {
+    auto cmd = CommandParser::parse("AUTH secret");
+    EXPECT_TRUE(cmd.valid);
+    EXPECT_EQ(cmd.name, "AUTH");
+    ASSERT_EQ(cmd.args.size(), 1u);
+    EXPECT_EQ(cmd.args[0], "secret");
+}
+
 // ============================================================================
 // Case Insensitivity
 // ============================================================================
@@ -135,6 +143,11 @@ TEST(ParserTest, PublishValid) {
     EXPECT_EQ(cmd.name, "PUBLISH");
     // Extra args beyond minimum 2 are silently accepted
     EXPECT_GE(cmd.args.size(), 2u);
+}
+
+TEST(ParserTest, AuthNeedsPassword) {
+    auto cmd = CommandParser::parse("AUTH");
+    EXPECT_FALSE(cmd.valid);
 }
 
 // ============================================================================
@@ -237,6 +250,13 @@ TEST(ParserTest, ReplicaOf) {
     ASSERT_EQ(cmd.args.size(), 2u);
     EXPECT_EQ(cmd.args[0], "127.0.0.1");
     EXPECT_EQ(cmd.args[1], "6379");
+}
+
+TEST(ParserTest, SyncCommand) {
+    auto cmd = CommandParser::parse("SYNC");
+    EXPECT_TRUE(cmd.valid);
+    EXPECT_EQ(cmd.name, "SYNC");
+    EXPECT_TRUE(cmd.args.empty());
 }
 
 TEST(ParserTest, InfoCommand) {
