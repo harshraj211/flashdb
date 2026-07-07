@@ -46,10 +46,15 @@ private:
     std::string executeCommand(const Command& cmd, platform::socket_t clientFd);
 
     // Execute a command without acquiring StorageEngine lock (called during atomic EXEC)
-    std::string executeCommandUnlocked(const Command& cmd, platform::socket_t clientFd);
+    std::string executeCommandUnlocked(const Command& cmd, platform::socket_t clientFd,
+                                       bool recordSideEffects = true);
 
     // Write response to client fd (thread-safe per-client)
     void writeToClient(platform::socket_t clientFd, const std::string& response);
+
+    // Authentication helpers. If no password is configured, every client is allowed.
+    bool isAuthenticated(platform::socket_t clientFd);
+    void markAuthenticated(platform::socket_t clientFd);
 
     // Config
     Config config_;
@@ -72,6 +77,8 @@ private:
     std::mutex clientsMutex_;
     std::unordered_map<platform::socket_t, std::shared_ptr<std::mutex>> clientWriteMutexes_;
     std::mutex writeMutexMapMutex_;
+    std::unordered_map<platform::socket_t, bool> authenticatedClients_;
+    std::mutex authMutex_;
 
     // Signal handling
     static Server* instance_;  // For signal handler access
