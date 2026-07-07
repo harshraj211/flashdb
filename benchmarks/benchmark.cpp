@@ -212,7 +212,8 @@ BenchmarkResult runReadBenchmark(const BenchmarkConfig& config) {
             std::vector<double> localLatencies;
             localLatencies.reserve(opsPerThread);
             thread_local std::mt19937 rng(std::random_device{}());
-            std::uniform_int_distribution<int> dist(0, allKeys.size() - 1);
+            std::uniform_int_distribution<int> dist(
+                0, static_cast<int>(allKeys.size()) - 1);
 
             for (int i = 0; i < opsPerThread; ++i) {
                 const std::string& key = allKeys[dist(rng)];
