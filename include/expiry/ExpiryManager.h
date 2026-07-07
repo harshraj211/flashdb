@@ -24,7 +24,9 @@ public:
     void removeExpiry(const std::string& key);
     void clear();
 
-    void startExpiryLoop(StorageEngine& storage);
+    void startExpiryLoop(StorageEngine& storage,
+                         std::chrono::milliseconds cleanupInterval =
+                             std::chrono::milliseconds(100));
 
 private:
     std::unordered_map<std::string,
