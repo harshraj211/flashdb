@@ -7,8 +7,34 @@
 #include <iostream>
 #include <algorithm>
 #include <cctype>
+#include <limits>
 
 namespace flashdb {
+
+namespace {
+
+std::string toUpperCopy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    return value;
+}
+
+bool parseNonNegativeSeconds(const std::string& token, int& seconds) {
+    try {
+        size_t consumed = 0;
+        long long value = std::stoll(token, &consumed);
+        if (consumed != token.size() || value < 0 ||
+            value > std::numeric_limits<int>::max()) {
+            return false;
+        }
+        seconds = static_cast<int>(value);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+} // namespace
 
 AOFManager::AOFManager(const std::string& filePath)
     : filePath_(filePath) {
@@ -40,6 +66,20 @@ void AOFManager::appendCommand(const std::string& rawCommand) {
     std::lock_guard<std::mutex> lock(writeMutex_);
     if (aofFile_.is_open()) {
         aofFile_ << rawCommand << '\n';
+        aofFile_.flush();
+    }
+}
+
+void AOFManager::appendCommands(const std::vector<std::string>& rawCommands) {
+    if (rawCommands.empty()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(writeMutex_);
+    if (aofFile_.is_open()) {
+        for (const auto& rawCommand : rawCommands) {
+            aofFile_ << rawCommand << '\n';
+        }
         aofFile_.flush();
     }
 }
@@ -86,23 +126,24 @@ int AOFManager::loadAOF(StorageEngine& storage, ExpiryManager& expiry) {
                 ++skipped;
                 continue;
             }
-            storage.set(cmd.args[0], cmd.args[1]);
-
-            // Check for EX option: SET key value EX seconds
-            if (cmd.args.size() >= 4) {
-                std::string option = cmd.args[2];
-                // Normalize to uppercase
-                std::transform(option.begin(), option.end(), option.begin(),
-                    [](unsigned char c) { return std::toupper(c); });
-                if (option == "EX") {
-                    try {
-                        int seconds = std::stoi(cmd.args[3]);
-                        expiry.setExpirySeconds(cmd.args[0], seconds);
-                    } catch (const std::exception& e) {
-                        std::cerr << "[AOF] Invalid EX value '" << cmd.args[3]
-                                  << "', ignoring expiry.\n";
-                    }
+            bool hasExpiry = false;
+            int seconds = 0;
+            if (cmd.args.size() != 2) {
+                if (cmd.args.size() != 4 || toUpperCopy(cmd.args[2]) != "EX" ||
+                    !parseNonNegativeSeconds(cmd.args[3], seconds)) {
+                    std::cerr << "[AOF] Invalid SET syntax, skipping line: '"
+                              << line << "'\n";
+                    ++skipped;
+                    continue;
                 }
+                hasExpiry = true;
+            }
+
+            storage.set(cmd.args[0], cmd.args[1]);
+            if (hasExpiry) {
+                expiry.setExpirySeconds(cmd.args[0], seconds);
+            } else {
+                expiry.removeExpiry(cmd.args[0]);
             }
         } else if (cmdName == "DEL") {
             if (cmd.args.empty()) {
@@ -117,14 +158,15 @@ int AOFManager::loadAOF(StorageEngine& storage, ExpiryManager& expiry) {
                 ++skipped;
                 continue;
             }
-            try {
-                int seconds = std::stoi(cmd.args[1]);
-                expiry.setExpirySeconds(cmd.args[0], seconds);
-            } catch (const std::exception& e) {
+            int seconds = 0;
+            if (!parseNonNegativeSeconds(cmd.args[1], seconds)) {
                 std::cerr << "[AOF] Invalid EXPIRE seconds '" << cmd.args[1]
                           << "', skipping.\n";
                 ++skipped;
                 continue;
+            }
+            if (storage.exists(cmd.args[0])) {
+                expiry.setExpirySeconds(cmd.args[0], seconds);
             }
         } else if (cmdName == "FLUSHALL") {
             storage.flushAll();
