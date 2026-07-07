@@ -2,6 +2,7 @@
 #include <string>
 #include <fstream>
 #include <mutex>
+#include <vector>
 
 namespace flashdb {
 
@@ -15,6 +16,9 @@ public:
     
     // Append a write command to AOF file (thread-safe)
     void appendCommand(const std::string& rawCommand);
+
+    // Append multiple write commands under one file lock (thread-safe)
+    void appendCommands(const std::vector<std::string>& rawCommands);
     
     // Load and replay commands from AOF on startup
     // Returns number of commands successfully replayed
