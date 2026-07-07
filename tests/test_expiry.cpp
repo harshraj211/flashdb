@@ -64,6 +64,13 @@ TEST_F(ExpiryTest, ExpiredKeyReturnsMinusTwo) {
     EXPECT_EQ(ttl, -2);
 }
 
+TEST_F(ExpiryTest, SubSecondTTLReturnsZeroBeforeExpiry) {
+    expiry.setExpiry("key", std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(500));
+    EXPECT_EQ(expiry.getTTL("key"), 0);
+    EXPECT_FALSE(expiry.isExpired("key"));
+}
+
 // ============================================================================
 // Expiry Behavior
 // ============================================================================
