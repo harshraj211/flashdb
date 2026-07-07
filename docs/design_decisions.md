@@ -147,10 +147,12 @@ FlashDB only supports string values. Redis supports lists, sets, sorted sets,
 hashes, streams, and more. Each data structure would require its own storage
 and command set.
 
-### No Authentication → AUTH Command
-Any client can connect and execute any command. Implement `AUTH password` with
-SHA-256 hashed passwords stored in configuration. Reject all commands until
-`AUTH` succeeds.
+### Basic Authentication → Stronger Credential Handling
+FlashDB supports `--requirepass` and `AUTH password`, rejecting protected commands
+until each client authenticates. This is useful for local demos and controlled
+environments, but the password is currently provided and compared as plaintext.
+For production-style hardening, store a password hash in configuration and avoid
+sending credentials over plaintext TCP.
 
 ### Memory Unbounded → LRU Eviction
 FlashDB has no memory limit. Implement an LRU (Least Recently Used) eviction
@@ -300,4 +302,3 @@ RESP encodes argument count and byte lengths explicitly,
 making it immune to whitespace in values. This would also
 make FlashDB compatible with redis-cli and any Redis client
 library. Tracked as a future enhancement.
-
