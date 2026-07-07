@@ -8,8 +8,40 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <cctype>
+#include <limits>
 
 namespace flashdb {
+
+namespace {
+
+std::string toUpperCopy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    return value;
+}
+
+bool parseNonNegativeSeconds(const std::string& token, int& seconds) {
+    try {
+        size_t consumed = 0;
+        long long value = std::stoll(token, &consumed);
+        if (consumed != token.size() || value < 0 ||
+            value > std::numeric_limits<int>::max()) {
+            return false;
+        }
+        seconds = static_cast<int>(value);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+bool alreadyMarkedFailed(const std::vector<platform::socket_t>& failedFds,
+                         platform::socket_t fd) {
+    return std::find(failedFds.begin(), failedFds.end(), fd) != failedFds.end();
+}
+
+} // namespace
 
 ReplicationManager::ReplicationManager() = default;
 
@@ -56,7 +88,14 @@ bool ReplicationManager::sendFullSync(platform::socket_t replicaFd, StorageEngin
     // Use getAllEntriesUnlocked() since we already hold the shared lock on storage.
     auto entries = storage.getAllEntriesUnlocked();
     for (const auto& [key, value] : entries) {
-        std::string cmd = "SET " + key + " " + value + "\n";
+        std::string cmd = "SET " + key + " " + value;
+        if (storage.expiryMgr_) {
+            int ttl = storage.expiryMgr_->getTTL(key);
+            if (ttl >= 0) {
+                cmd += " EX " + std::to_string(ttl);
+            }
+        }
+        cmd += "\n";
         if (!writeToFd(replicaFd, cmd)) {
             std::cerr << "[REPL] Failed to send SET during full sync to fd "
                       << replicaFd << "\n";
@@ -74,20 +113,33 @@ bool ReplicationManager::sendFullSync(platform::socket_t replicaFd, StorageEngin
 }
 
 void ReplicationManager::propagate(const std::string& command) {
+    propagateBatch({command});
+}
+
+void ReplicationManager::propagateBatch(const std::vector<std::string>& commands) {
+    if (commands.empty()) {
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(replicaMutex_);
 
     if (replicaFds_.empty()) {
         return;
     }
 
-    std::string data = command + "\n";
     std::vector<platform::socket_t> failedFds;
 
-    for (platform::socket_t fd : replicaFds_) {
-        if (!writeToFd(fd, data)) {
-            std::cerr << "[REPL] Failed to propagate to replica fd " << fd
-                      << ", marking for removal.\n";
-            failedFds.push_back(fd);
+    for (const auto& command : commands) {
+        std::string data = command + "\n";
+        for (platform::socket_t fd : replicaFds_) {
+            if (alreadyMarkedFailed(failedFds, fd)) {
+                continue;
+            }
+            if (!writeToFd(fd, data)) {
+                std::cerr << "[REPL] Failed to propagate to replica fd " << fd
+                          << ", marking for removal.\n";
+                failedFds.push_back(fd);
+            }
         }
     }
 
@@ -101,14 +153,16 @@ void ReplicationManager::propagate(const std::string& command) {
     }
 }
 
-void ReplicationManager::removeReplica(platform::socket_t replicaFd) {
+bool ReplicationManager::removeReplica(platform::socket_t replicaFd) {
     std::lock_guard<std::mutex> lock(replicaMutex_);
     auto it = std::find(replicaFds_.begin(), replicaFds_.end(), replicaFd);
     if (it != replicaFds_.end()) {
         replicaFds_.erase(it);
         platform::closeSocket(replicaFd);
         std::cout << "[REPL] Removed replica fd " << replicaFd << "\n";
+        return true;
     }
+    return false;
 }
 
 void ReplicationManager::connectToMaster(const std::string& host, uint16_t port,
@@ -143,8 +197,8 @@ void ReplicationManager::connectToMaster(const std::string& host, uint16_t port,
     isMaster_ = false;
     masterFd_ = sockFd;
 
-    // Send handshake
-    writeToFd(sockFd, "REPLICAOF\n");
+    // Send handshake requesting that the master registers this socket as a replica.
+    writeToFd(sockFd, "SYNC\n");
 
     // Launch background thread for replication stream processing
     replicationThread_ = std::jthread([this, &storage, &expiry](std::stop_token stopToken) {
@@ -209,18 +263,23 @@ void ReplicationManager::processReplicationStream(platform::socket_t masterFd,
 
             if (cmd.name == "SET") {
                 if (cmd.args.size() >= 2) {
-                    storage.set(cmd.args[0], cmd.args[1]);
-                    // Handle SET key value EX seconds
-                    if (cmd.args.size() >= 4) {
-                        std::string option = cmd.args[2];
-                        std::transform(option.begin(), option.end(), option.begin(),
-                            [](unsigned char c) { return std::toupper(c); });
-                        if (option == "EX") {
-                            try {
-                                int seconds = std::stoi(cmd.args[3]);
-                                expiry.setExpirySeconds(cmd.args[0], seconds);
-                            } catch (...) {}
+                    bool hasExpiry = false;
+                    int seconds = 0;
+                    if (cmd.args.size() != 2) {
+                        if (cmd.args.size() != 4 || toUpperCopy(cmd.args[2]) != "EX" ||
+                            !parseNonNegativeSeconds(cmd.args[3], seconds)) {
+                            std::cerr << "[REPL] Skipping invalid SET syntax: "
+                                      << line << "\n";
+                            continue;
                         }
+                        hasExpiry = true;
+                    }
+
+                    storage.set(cmd.args[0], cmd.args[1]);
+                    if (hasExpiry) {
+                        expiry.setExpirySeconds(cmd.args[0], seconds);
+                    } else {
+                        expiry.removeExpiry(cmd.args[0]);
                     }
                 }
             } else if (cmd.name == "DEL") {
@@ -229,10 +288,11 @@ void ReplicationManager::processReplicationStream(platform::socket_t masterFd,
                 }
             } else if (cmd.name == "EXPIRE") {
                 if (cmd.args.size() >= 2) {
-                    try {
-                        int seconds = std::stoi(cmd.args[1]);
+                    int seconds = 0;
+                    if (parseNonNegativeSeconds(cmd.args[1], seconds) &&
+                        storage.exists(cmd.args[0])) {
                         expiry.setExpirySeconds(cmd.args[0], seconds);
-                    } catch (...) {}
+                    }
                 }
             } else if (cmd.name == "FLUSHALL") {
                 storage.flushAll();
@@ -261,6 +321,9 @@ bool ReplicationManager::writeToFd(platform::socket_t fd, const std::string& dat
             }
             std::cerr << "[REPL] write() failed on fd " << fd << ": "
                       << platform::getLastSocketError() << "\n";
+            return false;
+        }
+        if (written == 0) {
             return false;
         }
         ptr += written;
