@@ -173,6 +173,27 @@ does not exist.
 
 ---
 
+### Authentication Commands
+
+#### AUTH
+
+Authenticate the current client when the server is started with
+`--requirepass <password>`.
+
+```
+AUTH password
+```
+
+**Response**:
+- `OK` if the password is correct
+- `ERR invalid password` if the password is incorrect
+- `ERR AUTH called without any password configured` if auth is disabled
+
+When `--requirepass` is configured, all commands except `AUTH` and `PING` return
+`NOAUTH Authentication required` until the client authenticates.
+
+---
+
 ### Pub/Sub Commands
 
 #### SUBSCRIBE
