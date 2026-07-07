@@ -1,0 +1,13 @@
+.git
+build
+cmake-build-*
+data
+benchmarks/benchmark_report.md
+.vscode
+.idea
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.exe
+*.log
