@@ -1,12 +1,88 @@
 #include "server/Server.h"
 
+#include <chrono>
 #include <csignal>
 #include <cstring>
 #include <algorithm>
+#include <cctype>
 #include <iostream>
+#include <limits>
 #include <sstream>
 
 namespace flashdb {
+
+namespace {
+
+std::string toUpperCopy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) {
+                       return static_cast<char>(std::toupper(c));
+                   });
+    return value;
+}
+
+bool parseNonNegativeSeconds(const std::string& token, int& seconds) {
+    try {
+        size_t consumed = 0;
+        long long value = std::stoll(token, &consumed);
+        if (consumed != token.size() || value < 0 ||
+            value > std::numeric_limits<int>::max()) {
+            return false;
+        }
+        seconds = static_cast<int>(value);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+struct SetExpiryOptions {
+    bool valid = true;
+    bool hasExpiry = false;
+    int seconds = 0;
+    std::string error;
+};
+
+SetExpiryOptions parseSetExpiryOptions(const Command& cmd) {
+    SetExpiryOptions options;
+    if (cmd.args.size() == 2) {
+        return options;
+    }
+
+    if (cmd.args.size() != 4 || toUpperCopy(cmd.args[2]) != "EX") {
+        options.valid = false;
+        options.error = "ERR syntax error\n";
+        return options;
+    }
+
+    if (!parseNonNegativeSeconds(cmd.args[3], options.seconds)) {
+        options.valid = false;
+        options.error = "ERR value is not an integer or out of range\n";
+        return options;
+    }
+
+    options.hasExpiry = true;
+    return options;
+}
+
+bool isWriteCommand(const Command& cmd) {
+    return cmd.name == "SET" || cmd.name == "DEL" ||
+           cmd.name == "FLUSHALL" || cmd.name == "EXPIRE";
+}
+
+std::string serializeCommand(const Command& cmd) {
+    std::string raw = cmd.name;
+    for (const auto& arg : cmd.args) {
+        raw += " " + arg;
+    }
+    return raw;
+}
+
+bool isErrorResponse(const std::string& response) {
+    return response.rfind("ERR", 0) == 0;
+}
+
+} // namespace
 
 // Static member initialization
 Server* Server::instance_ = nullptr;
@@ -41,7 +117,8 @@ Server::Server(const Config& config)
 
     // Start the background thread that actively expires keys whose TTLs
     // have elapsed, preventing unbounded memory growth from lazy-only expiry.
-    expiry_.startExpiryLoop(storage_);
+    expiry_.startExpiryLoop(
+        storage_, std::chrono::milliseconds(config_.expiryCleanupIntervalMs));
 
     // Store instance pointer for the static signal handler.
     instance_ = this;
@@ -258,7 +335,15 @@ void Server::handleClient(platform::socket_t clientFd, std::string clientAddress
     pubsub_.removeClient(static_cast<int>(clientFd));
     txManager_.removeClient(static_cast<int>(clientFd));
 
-    platform::closeSocket(clientFd);
+    if (!replication_.removeReplica(clientFd)) {
+        platform::closeSocket(clientFd);
+    }
+
+    // Remove authentication state for this socket.
+    {
+        std::lock_guard<std::mutex> lock(authMutex_);
+        authenticatedClients_.erase(clientFd);
+    }
 
     // Remove the per-client write mutex.
     {
@@ -274,6 +359,25 @@ void Server::handleClient(platform::socket_t clientFd, std::string clientAddress
 // ---------------------------------------------------------------------------
 std::string Server::processCommand(const Command& cmd, platform::socket_t clientFd) {
     int clientKey = static_cast<int>(clientFd);
+
+    // ---- Authentication guard ----
+    // AUTH is handled before pub/sub and transaction state, so locked-out
+    // clients cannot queue protected work or use special modes to bypass auth.
+    if (!config_.requirePassword.empty()) {
+        if (cmd.name == "AUTH") {
+            if (cmd.args[0] == config_.requirePassword) {
+                markAuthenticated(clientFd);
+                return "OK\n";
+            }
+            return "ERR invalid password\n";
+        }
+
+        if (!isAuthenticated(clientFd) && cmd.name != "PING") {
+            return "NOAUTH Authentication required\n";
+        }
+    } else if (cmd.name == "AUTH") {
+        return "ERR AUTH called without any password configured\n";
+    }
     
     // ---- Pub/Sub mode guard ----
     // Once a client enters subscription mode, only a narrow set of commands
@@ -299,26 +403,24 @@ std::string Server::processCommand(const Command& cmd, platform::socket_t client
             }
 
             std::ostringstream oss;
+            std::vector<std::string> sideEffectCommands;
             // Acquire exclusive lock on StorageEngine ONCE for the duration of the transaction.
             {
                 std::unique_lock<std::shared_mutex> txLock(storage_.getMutex());
                 for (size_t i = 0; i < queued.size(); ++i) {
-                    std::string result = executeCommandUnlocked(queued[i], clientFd);
+                    std::string result = executeCommandUnlocked(queued[i], clientFd, false);
                     oss << (i + 1) << ") " << result;
+                    if (isWriteCommand(queued[i]) && !isErrorResponse(result)) {
+                        sideEffectCommands.push_back(serializeCommand(queued[i]));
+                    }
                 }
             }
 
-            // Propagate write commands that were part of the transaction
-            // to replicas.  We re-serialize the raw commands.
-            for (const auto& qcmd : queued) {
-                if (qcmd.name == "SET" || qcmd.name == "DEL" ||
-                    qcmd.name == "FLUSHALL" || qcmd.name == "EXPIRE") {
-                    std::string raw = qcmd.name;
-                    for (const auto& arg : qcmd.args) {
-                        raw += " " + arg;
-                    }
-                    replication_.propagate(raw);
+            if (!sideEffectCommands.empty()) {
+                if (aof_) {
+                    aof_->appendCommands(sideEffectCommands);
                 }
+                replication_.propagateBatch(sideEffectCommands);
             }
 
             return oss.str();
@@ -349,11 +451,7 @@ std::string Server::executeCommand(const Command& cmd, platform::socket_t client
     
     // Helper: reconstruct the raw command string for AOF / replication.
     auto rawCommand = [&]() -> std::string {
-        std::string raw = cmd.name;
-        for (const auto& arg : cmd.args) {
-            raw += " " + arg;
-        }
-        return raw;
+        return serializeCommand(cmd);
     };
 
     // ---- PING ----
@@ -369,16 +467,16 @@ std::string Server::executeCommand(const Command& cmd, platform::socket_t client
         const std::string& key = cmd.args[0];
         const std::string& value = cmd.args[1];
 
-        storage_.set(key, value);
+        SetExpiryOptions expiryOptions = parseSetExpiryOptions(cmd);
+        if (!expiryOptions.valid) {
+            return expiryOptions.error;
+        }
 
-        // Optional EX flag for inline TTL.
-        if (cmd.args.size() >= 4 && cmd.args[2] == "EX") {
-            try {
-                int seconds = std::stoi(cmd.args[3]);
-                expiry_.setExpirySeconds(key, seconds);
-            } catch (const std::exception&) {
-                return "ERR value is not an integer or out of range\n";
-            }
+        storage_.set(key, value);
+        if (expiryOptions.hasExpiry) {
+            expiry_.setExpirySeconds(key, expiryOptions.seconds);
+        } else {
+            expiry_.removeExpiry(key);
         }
 
         if (aof_) {
@@ -451,15 +549,15 @@ std::string Server::executeCommand(const Command& cmd, platform::socket_t client
     // ---- EXPIRE key seconds ----
     if (cmd.name == "EXPIRE") {
         const std::string& key = cmd.args[0];
+        int seconds = 0;
+        if (!parseNonNegativeSeconds(cmd.args[1], seconds)) {
+            return "ERR value is not an integer or out of range\n";
+        }
+
         if (!storage_.exists(key)) {
             return "(integer) 0\n";
         }
-        try {
-            int seconds = std::stoi(cmd.args[1]);
-            expiry_.setExpirySeconds(key, seconds);
-        } catch (const std::exception&) {
-            return "ERR value is not an integer or out of range\n";
-        }
+        expiry_.setExpirySeconds(key, seconds);
 
         if (aof_) {
             aof_->appendCommand(rawCommand());
@@ -513,6 +611,12 @@ std::string Server::executeCommand(const Command& cmd, platform::socket_t client
         return txManager_.discardTransaction(clientKey) + "\n";
     }
 
+    // ---- SYNC (internal replication handshake) ----
+    if (cmd.name == "SYNC") {
+        replication_.addReplica(clientFd, storage_);
+        return "";
+    }
+
     // ---- REPLICAOF host port ----
     if (cmd.name == "REPLICAOF") {
         try {
@@ -529,6 +633,10 @@ std::string Server::executeCommand(const Command& cmd, platform::socket_t client
         return info_.getInfo();
     }
 
+    if (cmd.name == "AUTH") {
+        return "ERR AUTH called without any password configured\n";
+    }
+
     // ---- Unknown command ----
     return "ERR unknown command '" + cmd.name + "'\n";
 }
@@ -536,16 +644,13 @@ std::string Server::executeCommand(const Command& cmd, platform::socket_t client
 // ---------------------------------------------------------------------------
 // executeCommandUnlocked() — same as executeCommand but uses unlocked storage calls
 // ---------------------------------------------------------------------------
-std::string Server::executeCommandUnlocked(const Command& cmd, platform::socket_t clientFd) {
+std::string Server::executeCommandUnlocked(const Command& cmd, platform::socket_t clientFd,
+                                           bool recordSideEffects) {
     int clientKey = static_cast<int>(clientFd);
     
     // Helper: reconstruct the raw command string for AOF / replication.
     auto rawCommand = [&]() -> std::string {
-        std::string raw = cmd.name;
-        for (const auto& arg : cmd.args) {
-            raw += " " + arg;
-        }
-        return raw;
+        return serializeCommand(cmd);
     };
 
     // ---- PING ----
@@ -561,22 +666,24 @@ std::string Server::executeCommandUnlocked(const Command& cmd, platform::socket_
         const std::string& key = cmd.args[0];
         const std::string& value = cmd.args[1];
 
-        storage_.setUnlocked(key, value);
-
-        // Optional EX flag for inline TTL.
-        if (cmd.args.size() >= 4 && cmd.args[2] == "EX") {
-            try {
-                int seconds = std::stoi(cmd.args[3]);
-                expiry_.setExpirySeconds(key, seconds);
-            } catch (const std::exception&) {
-                return "ERR value is not an integer or out of range\n";
-            }
+        SetExpiryOptions expiryOptions = parseSetExpiryOptions(cmd);
+        if (!expiryOptions.valid) {
+            return expiryOptions.error;
         }
 
-        if (aof_) {
+        storage_.setUnlocked(key, value);
+        if (expiryOptions.hasExpiry) {
+            expiry_.setExpirySeconds(key, expiryOptions.seconds);
+        } else {
+            expiry_.removeExpiry(key);
+        }
+
+        if (recordSideEffects && aof_) {
             aof_->appendCommand(rawCommand());
         }
-        replication_.propagate(rawCommand());
+        if (recordSideEffects) {
+            replication_.propagate(rawCommand());
+        }
 
         return "OK\n";
     }
@@ -591,10 +698,12 @@ std::string Server::executeCommandUnlocked(const Command& cmd, platform::socket_
     if (cmd.name == "DEL") {
         int count = storage_.delUnlocked(cmd.args);
 
-        if (aof_) {
+        if (recordSideEffects && aof_) {
             aof_->appendCommand(rawCommand());
         }
-        replication_.propagate(rawCommand());
+        if (recordSideEffects) {
+            replication_.propagate(rawCommand());
+        }
 
         return "(integer) " + std::to_string(count) + "\n";
     }
@@ -622,10 +731,12 @@ std::string Server::executeCommandUnlocked(const Command& cmd, platform::socket_
     if (cmd.name == "FLUSHALL") {
         storage_.flushAllUnlocked();
 
-        if (aof_) {
+        if (recordSideEffects && aof_) {
             aof_->appendCommand(rawCommand());
         }
-        replication_.propagate(rawCommand());
+        if (recordSideEffects) {
+            replication_.propagate(rawCommand());
+        }
 
         return "OK\n";
     }
@@ -643,20 +754,22 @@ std::string Server::executeCommandUnlocked(const Command& cmd, platform::socket_
     // ---- EXPIRE key seconds ----
     if (cmd.name == "EXPIRE") {
         const std::string& key = cmd.args[0];
-        if (!storage_.existsUnlocked(key)) {
-            return "(integer) 0\n";
-        }
-        try {
-            int seconds = std::stoi(cmd.args[1]);
-            expiry_.setExpirySeconds(key, seconds);
-        } catch (const std::exception&) {
+        int seconds = 0;
+        if (!parseNonNegativeSeconds(cmd.args[1], seconds)) {
             return "ERR value is not an integer or out of range\n";
         }
 
-        if (aof_) {
+        if (!storage_.existsUnlocked(key)) {
+            return "(integer) 0\n";
+        }
+        expiry_.setExpirySeconds(key, seconds);
+
+        if (recordSideEffects && aof_) {
             aof_->appendCommand(rawCommand());
         }
-        replication_.propagate(rawCommand());
+        if (recordSideEffects) {
+            replication_.propagate(rawCommand());
+        }
 
         return "(integer) 1\n";
     }
@@ -705,15 +818,13 @@ std::string Server::executeCommandUnlocked(const Command& cmd, platform::socket_
         return txManager_.discardTransaction(clientKey) + "\n";
     }
 
-    // ---- REPLICAOF host port ----
+    // ---- SYNC cannot run inside a transaction ----
+    if (cmd.name == "SYNC") {
+        return "ERR SYNC is only valid as a replication handshake\n";
+    }
+
     if (cmd.name == "REPLICAOF") {
-        try {
-            uint16_t port = static_cast<uint16_t>(std::stoi(cmd.args[1]));
-            replication_.connectToMaster(cmd.args[0], port, storage_, expiry_);
-        } catch (const std::exception&) {
-            return "ERR invalid port number\n";
-        }
-        return "OK\n";
+        return "ERR REPLICAOF is not allowed in transactions\n";
     }
 
     // ---- INFO ----
@@ -721,8 +832,30 @@ std::string Server::executeCommandUnlocked(const Command& cmd, platform::socket_
         return info_.getInfo();
     }
 
+    if (cmd.name == "AUTH") {
+        return "ERR AUTH called without any password configured\n";
+    }
+
     // ---- Unknown command ----
     return "ERR unknown command '" + cmd.name + "'\n";
+}
+
+// ---------------------------------------------------------------------------
+// Authentication helpers
+// ---------------------------------------------------------------------------
+bool Server::isAuthenticated(platform::socket_t clientFd) {
+    if (config_.requirePassword.empty()) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(authMutex_);
+    auto it = authenticatedClients_.find(clientFd);
+    return it != authenticatedClients_.end() && it->second;
+}
+
+void Server::markAuthenticated(platform::socket_t clientFd) {
+    std::lock_guard<std::mutex> lock(authMutex_);
+    authenticatedClients_[clientFd] = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -752,6 +885,9 @@ void Server::writeToClient(platform::socket_t clientFd, const std::string& respo
                 continue;  // Interrupted by signal — retry.
             }
             // EPIPE / ECONNRESET → client gone; nothing useful to do.
+            break;
+        }
+        if (written == 0) {
             break;
         }
         data += written;
