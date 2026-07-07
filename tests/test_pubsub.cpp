@@ -87,6 +87,20 @@ TEST_F(PubSubTest, PublishOnlyToCorrectChannel) {
     EXPECT_EQ(capturedMessages[0].first, 100);  // Only the news subscriber
 }
 
+TEST_F(PubSubTest, PublishCallbackCanChangeSubscriptions) {
+    pubsub.subscribe("news", 100);
+
+    int receivers = pubsub.publish("news", "update",
+        [this](int fd, const std::string& msg) {
+            capturedMessages.emplace_back(fd, msg);
+            pubsub.unsubscribe("news", fd);
+        });
+
+    EXPECT_EQ(receivers, 1);
+    ASSERT_EQ(capturedMessages.size(), 1u);
+    EXPECT_FALSE(pubsub.isSubscribed(100));
+}
+
 // ============================================================================
 // Client Lifecycle
 // ============================================================================
