@@ -39,11 +39,14 @@ int ExpiryManager::getTTL(const std::string& key) const {
     }
 
     auto now = std::chrono::steady_clock::now();
+    if (now >= it->second) {
+        return -2;
+    }
     auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
         it->second - now
     ).count();
 
-    if (remaining <= 0) {
+    if (remaining < 0) {
         // Key has already expired — return -2.
         return -2;
     }
@@ -66,12 +69,13 @@ void ExpiryManager::clear() {
     expiryMap_.clear();
 }
 
-void ExpiryManager::startExpiryLoop(StorageEngine& storage) {
+void ExpiryManager::startExpiryLoop(StorageEngine& storage,
+                                    std::chrono::milliseconds cleanupInterval) {
     if (expiryThread_.joinable()) {
         return; // Already running
     }
 
-    expiryThread_ = std::jthread([this, &storage](std::stop_token stopToken) {
+    expiryThread_ = std::jthread([this, &storage, cleanupInterval](std::stop_token stopToken) {
         while (!stopToken.stop_requested()) {
             std::vector<std::string> expiredKeys;
 
@@ -93,7 +97,7 @@ void ExpiryManager::startExpiryLoop(StorageEngine& storage) {
             }
 
             // Sleep between cleanup cycles.
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(cleanupInterval);
         }
     });
 }
