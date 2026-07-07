@@ -24,8 +24,10 @@ const std::unordered_map<std::string, int> CommandParser::minArgs_ = {
     {"EXEC",      0},  // EXEC
     {"DISCARD",   0},  // DISCARD
     {"REPLICAOF", 2},  // REPLICAOF host port
+    {"SYNC",      0},  // Internal replication handshake
     {"INFO",      0},  // INFO [section]
     {"PING",      0},  // PING [message]
+    {"AUTH",      1},  // AUTH password
 };
 
 // NOTE: Whitespace-delimited tokenization. Keys and values
@@ -65,7 +67,9 @@ Command CommandParser::parse(const std::string& rawInput) {
     // Command name is always uppercase for consistent dispatch.
     cmd.name = tokens[0];
     std::transform(cmd.name.begin(), cmd.name.end(), cmd.name.begin(),
-                   [](unsigned char c) { return std::toupper(c); });
+                   [](unsigned char c) {
+                       return static_cast<char>(std::toupper(c));
+                   });
 
     // Remaining tokens become command arguments.
     cmd.args.assign(tokens.begin() + 1, tokens.end());
