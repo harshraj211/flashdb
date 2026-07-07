@@ -26,9 +26,12 @@ public:
     
     // Propagate a write command to all connected replicas
     void propagate(const std::string& command);
+
+    // Propagate several write commands while holding the replica lock once
+    void propagateBatch(const std::vector<std::string>& commands);
     
     // Remove a replica that disconnected
-    void removeReplica(platform::socket_t replicaFd);
+    bool removeReplica(platform::socket_t replicaFd);
     
     // === Replica-side methods ===
     
