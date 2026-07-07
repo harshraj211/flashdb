@@ -12,7 +12,7 @@ struct Config {
     int expiryCleanupIntervalMs = 100;
     std::string requirePassword = "";  // empty = no auth
 
-    // Parse from command line args: --host, --port, --aof-path, --no-aof
+    // Parse from command line args.
     static Config fromArgs(int argc, char* argv[]);
 };
 
