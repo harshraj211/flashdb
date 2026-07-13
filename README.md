@@ -1,27 +1,39 @@
-# FlashDB
+<div align="center">
 
-FlashDB is a production-inspired, Redis-like, in-memory key-value database
-built from scratch in C++20. Its goal is not to replace Redis, but to serve
-as a practical deep-dive into database internals, networking, concurrency,
-persistence, TTL, transactions, pub/sub, replication, and benchmarking.
+# ⚡ FlashDB
 
-## Highlights
+### A Redis-inspired, in-memory key-value database built from scratch in C++20
 
-- In-memory key-value storage using `std::unordered_map`
-- Average O(1) `GET`, `SET`, and `DEL` operations
-- TTL support with lazy expiry and active background cleanup
-- Append Only File (AOF) persistence for crash recovery
-- Pub/Sub messaging with channels and subscribers
-- `MULTI` / `EXEC` / `DISCARD` transactions
-- Master-replica replication with full sync and live propagation
-- Thread-safe reads and writes using `std::shared_mutex`
-- TCP server with a thread-per-client model
-- Server stats through the `INFO` command
-- Benchmark tool for throughput and latency testing
-- GoogleTest test suite
-- Docker and GitHub Actions CI support
+FlashDB is a production-inspired, Redis-like, in-memory key-value database. Its goal is not to replace Redis, but to serve as a practical deep-dive into database internals, networking, concurrency, persistence, TTL, transactions, pub/sub, replication, and benchmarking.
 
-## Architecture
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?style=for-the-badge&logo=cplusplus)](https://en.cppreference.com/w/cpp/20)
+[![CMake](https://img.shields.io/badge/Build-CMake-064F8C?style=for-the-badge&logo=cmake)](https://cmake.org/)
+[![GoogleTest](https://img.shields.io/badge/Tests-GoogleTest-4285F4?style=for-the-badge&logo=google)](https://github.com/google/googletest)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker)](https://www.docker.com/)
+
+</div>
+
+---
+
+## ✨ Highlights
+
+- 🗂️ In-memory key-value storage using `std::unordered_map`
+- ⚡ Average O(1) `GET`, `SET`, and `DEL` operations
+- ⏱️ TTL support with lazy expiry and active background cleanup
+- 💾 Append Only File (AOF) persistence for crash recovery
+- 📡 Pub/Sub messaging with channels and subscribers
+- 🔒 `MULTI` / `EXEC` / `DISCARD` transactions
+- 🔁 Master-replica replication with full sync and live propagation
+- 🧵 Thread-safe reads and writes using `std::shared_mutex`
+- 🌐 TCP server with a thread-per-client model
+- 📊 Server stats through the `INFO` command
+- 🚀 Benchmark tool for throughput and latency testing
+- ✅ GoogleTest test suite
+- 🐳 Docker and GitHub Actions CI support
+
+---
+
+## 🏗️ Architecture
 
 ```text
 CLIENT
@@ -36,18 +48,17 @@ CLIENT
        -> INFO MANAGER
 ```
 
-The client connects over TCP. The server reads commands from the socket,
-parses them into structured commands, executes them against the storage
-engine or supporting managers, and writes responses back to the client.
+The client connects over TCP. The server reads commands from the socket, parses them into structured commands, executes them against the storage engine or supporting managers, and writes responses back to the client.
 
-## Core Components
+---
 
-### TCP Server
+## 🧩 Core Components
 
-The TCP server accepts connections and creates one thread for each client.
-Each client thread reads commands, executes them, and sends responses.
+### 🌐 TCP Server
 
-Important concepts:
+The TCP server accepts connections and creates one thread for each client. Each client thread reads commands, executes them, and sends responses.
+
+**Important concepts:**
 
 - Sockets
 - Blocking I/O
@@ -55,18 +66,16 @@ Important concepts:
 - Client lifecycle
 - Graceful shutdown
 
-### Command Parser
+### 🔤 Command Parser
 
 The parser converts raw text commands into a `Command` object.
-
-Example:
 
 ```text
 Input:  SET name Harsh
 Output: Command{name="SET", args=["name", "Harsh"]}
 ```
 
-### Storage Engine
+### 🗄️ Storage Engine
 
 The storage engine stores data in memory using:
 
@@ -74,23 +83,18 @@ The storage engine stores data in memory using:
 std::unordered_map<std::string, std::string>
 ```
 
-`unordered_map` is used because key-value databases need fast direct key
-lookup. Average-case lookup, insert, and delete are O(1).
+`unordered_map` is used because key-value databases need fast direct key lookup. Average-case lookup, insert, and delete are O(1).
 
-### Expiry Manager
+### ⏱️ Expiry Manager
 
-FlashDB supports TTL. A key can expire after a fixed time. Expiry is handled
-using two strategies:
+FlashDB supports TTL. A key can expire after a fixed time. Expiry is handled using two strategies:
 
-- **Lazy expiry**: check expiry when the key is accessed
-- **Active expiry**: background thread periodically deletes expired keys
+- **Lazy expiry** — check expiry when the key is accessed
+- **Active expiry** — background thread periodically deletes expired keys
 
-### AOF Persistence
+### 💾 AOF Persistence
 
-AOF means Append Only File. Every write command is appended to a file. On
-restart, FlashDB replays the AOF to rebuild the database state.
-
-Example AOF:
+AOF means Append Only File. Every write command is appended to a file. On restart, FlashDB replays the AOF to rebuild the database state.
 
 ```text
 SET name Harsh
@@ -98,24 +102,18 @@ SET city Delhi
 DEL city
 ```
 
-### Pub/Sub Manager
+### 📡 Pub/Sub Manager
 
-Pub/Sub allows clients to subscribe to channels and receive messages published
-to those channels.
-
-Example:
+Pub/Sub allows clients to subscribe to channels and receive messages published to those channels.
 
 ```text
 SUBSCRIBE news
 PUBLISH news hello
 ```
 
-### Transaction Manager
+### 🔒 Transaction Manager
 
-Transactions allow clients to queue commands using `MULTI` and execute them
-atomically using `EXEC`.
-
-Example:
+Transactions allow clients to queue commands using `MULTI` and execute them atomically using `EXEC`.
 
 ```text
 MULTI
@@ -125,18 +123,18 @@ GET a
 EXEC
 ```
 
-During `EXEC`, FlashDB holds an exclusive storage lock so other clients cannot
-interleave storage operations.
+> During `EXEC`, FlashDB holds an exclusive storage lock so other clients cannot interleave storage operations.
 
-### Replication Manager
+### 🔁 Replication Manager
 
-Replication allows a replica server to copy data from a master server. It has
-two phases:
+Replication allows a replica server to copy data from a master server. It has two phases:
 
-1. **Full sync**: master sends the current dataset to the replica
-2. **Live propagation**: future write commands are forwarded to replicas
+1. **Full sync** — master sends the current dataset to the replica
+2. **Live propagation** — future write commands are forwarded to replicas
 
-## Supported Commands
+---
+
+## 📋 Supported Commands
 
 ```text
 SET key value [EX seconds]
@@ -159,7 +157,9 @@ PING
 AUTH password
 ```
 
-## Build Instructions
+---
+
+## 🔨 Build Instructions
 
 ### Windows
 
@@ -189,7 +189,9 @@ Windows:
 .\build\Release\flashdb.exe
 ```
 
-## Server Options
+---
+
+## ⚙️ Server Options
 
 ```text
 --host HOST
@@ -201,7 +203,9 @@ Windows:
 --help
 ```
 
-## Benchmarking
+---
+
+## 📊 Benchmarking
 
 Run the server first, then run:
 
@@ -211,36 +215,37 @@ Run the server first, then run:
 
 The benchmark measures:
 
-- Write throughput
-- Read throughput
-- Mixed read/write throughput
-- Average latency
-- P99 latency
+| Metric | Description |
+| --- | --- |
+| Write throughput | Operations per second for `SET`/`DEL` |
+| Read throughput | Operations per second for `GET` |
+| Mixed read/write throughput | Combined workload performance |
+| Average latency | Mean response time |
+| P99 latency | 99th-percentile response time |
 
-## Design Decisions
+---
+
+## 🧠 Design Decisions
 
 ### Why `unordered_map` instead of `map`?
 
-`unordered_map` gives average O(1) lookup. `map` gives O(log n) lookup and
-keeps keys sorted, but FlashDB does not need sorted keys for normal
-operations.
+`unordered_map` gives average O(1) lookup. `map` gives O(log n) lookup and keeps keys sorted, but FlashDB does not need sorted keys for normal operations.
 
 ### Why AOF instead of snapshots?
 
-AOF records every write command, so it gives better durability than periodic
-snapshots. Snapshots can lose writes made after the last snapshot.
+AOF records every write command, so it gives better durability than periodic snapshots. Snapshots can lose writes made after the last snapshot.
 
 ### Why thread-per-client?
 
-Thread-per-client is simple to understand and implement. It works well for a
-learning project, but it does not scale well to very high client counts.
+Thread-per-client is simple to understand and implement. It works well for a learning project, but it does not scale well to very high client counts.
 
 ### Why `std::shared_mutex`?
 
-Read-heavy workloads benefit from allowing multiple readers at the same time.
-`std::shared_mutex` allows many concurrent readers or one exclusive writer.
+Read-heavy workloads benefit from allowing multiple readers at the same time. `std::shared_mutex` allows many concurrent readers or one exclusive writer.
 
-## Recently Fixed
+---
+
+## 🛠️ Recently Fixed
 
 - Invalid `SET ... EX` no longer mutates storage
 - Plain `SET` clears old TTL
@@ -250,7 +255,9 @@ Read-heavy workloads benefit from allowing multiple readers at the same time.
 - Replication handshake is wired through internal `SYNC`
 - AOF replay matches server TTL behavior more closely
 
-## Known Limitations
+---
+
+## ⚠️ Known Limitations
 
 - Not a Redis replacement
 - Text protocol is not binary-safe
@@ -262,7 +269,9 @@ Read-heavy workloads benefit from allowing multiple readers at the same time.
 - AOF rewrite is not implemented yet
 - Thread-per-client does not scale to very high client counts
 
-## Future Improvements
+---
+
+## 🗺️ Future Improvements
 
 - RESP protocol for Redis CLI compatibility
 - AOF rewrite and compaction
@@ -277,9 +286,16 @@ Read-heavy workloads benefit from allowing multiple readers at the same time.
 - Metrics and observability
 - Cluster/sharding support
 
-## Summary
+---
 
-Built FlashDB, a Redis-inspired in-memory key-value database in C++20 with
-TTL expiration, AOF persistence, pub/sub messaging, MULTI/EXEC transactions,
-master-replica replication, concurrency control using shared mutexes, and
-benchmarking support.
+## 📌 Summary
+
+Built FlashDB, a Redis-inspired in-memory key-value database in C++20 with TTL expiration, AOF persistence, pub/sub messaging, MULTI/EXEC transactions, master-replica replication, concurrency control using shared mutexes, and benchmarking support.
+
+---
+
+<div align="center">
+
+Built as a hands-on exploration of database internals, one component at a time. ⚡
+
+</div>
